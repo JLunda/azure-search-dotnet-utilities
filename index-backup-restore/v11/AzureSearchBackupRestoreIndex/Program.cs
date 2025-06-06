@@ -10,15 +10,20 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Azure;
+using Azure.Identity;
 using Azure.Search.Documents;
 using Azure.Search.Documents.Indexes;
 using Azure.Search.Documents.Models;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Identity.Client;
+using Newtonsoft.Json.Serialization;
 
 namespace AzureSearchBackupRestoreIndex;
 
 class Program
 {
+    private static AzureCloudInstance AzureCloudInstance = AzureCloudInstance.AzurePublic;
+    private static string SearchServiceDNSSuffix;
     private static string SourceSearchServiceName;
     private static string SourceAdminKey;
     private static string SourceIndexName;
@@ -26,6 +31,8 @@ class Program
     private static string TargetAdminKey;
     private static string TargetIndexName;
     private static string BackupDirectory;
+    private static AuthenticationMethodEnum AuthenticationMethod;
+    private static IndexCopyModeEnum IndexCopyMode;
 
     private static SearchIndexClient SourceIndexClient;
     private static SearchClient SourceSearchClient;
@@ -43,7 +50,20 @@ class Program
 
         //Backup the source index
         Console.WriteLine("\nSTART INDEX BACKUP");
-        BackupIndexAndDocuments();
+        switch (IndexCopyMode)
+        {
+            case IndexCopyModeEnum.Single:
+                BackupIndexAndDocuments(SourceIndexName);
+                break;
+
+            case IndexCopyModeEnum.All:
+            default:
+                foreach (var index in SourceIndexClient.GetIndexes())
+                {
+                    BackupIndexAndDocuments(index.Name);
+                }
+                break;
+        }
 
         //Recreate and import content to target index
         Console.WriteLine("\nSTART INDEX RESTORE");
@@ -71,6 +91,7 @@ class Program
         IConfigurationBuilder builder = new ConfigurationBuilder().AddJsonFile("appsettings.json");
         IConfigurationRoot configuration = builder.Build();
 
+        AzureCloudInstance = Enum.TryParse(configuration["AzureCloud"], out AzureCloudInstance azureCloudInstanceParsed) ? azureCloudInstanceParsed : AzureCloudInstance.AzurePublic;
         SourceSearchServiceName = configuration["SourceSearchServiceName"];
         SourceAdminKey = configuration["SourceAdminKey"];
         SourceIndexName = configuration["SourceIndexName"];
@@ -78,28 +99,68 @@ class Program
         TargetAdminKey = configuration["TargetAdminKey"];
         TargetIndexName = configuration["TargetIndexName"];
         BackupDirectory = configuration["BackupDirectory"];
+        AuthenticationMethod = Enum.TryParse(configuration["AuthenticationMethod"], out AuthenticationMethodEnum shouldUseManagedIdentityParsed) ? shouldUseManagedIdentityParsed : AuthenticationMethodEnum.ManagedIdentity;
+        IndexCopyMode = Enum.TryParse(configuration["IndexCopyMode"], ignoreCase: true, out IndexCopyModeEnum indexCopyModeParsed) ? indexCopyModeParsed : IndexCopyModeEnum.All;
 
-        Console.WriteLine("CONFIGURATION:");
-        Console.WriteLine("\n  Source service and index {0}, {1}", SourceSearchServiceName, SourceIndexName);
-        Console.WriteLine("\n  Target service and index: {0}, {1}", TargetSearchServiceName, TargetIndexName);
-        Console.WriteLine("\n  Backup directory: " + BackupDirectory);
-        Console.WriteLine("\nDoes this look correct? Press any key to continue, Ctrl+C to cancel.");
+        Console.WriteLine($$"""
+        CONFIGURATION:
+            Azure Cloud: {{AzureCloudInstance}}
+            Authentication Method: {{AuthenticationMethod}}
+            Index Copy Mode: {{IndexCopyMode}}
+            Source service: {{SourceSearchServiceName}}
+            Source Index: {{(string.IsNullOrWhiteSpace(SourceIndexName) ? "N/A" : SourceIndexName)}}
+            Target service: {{TargetSearchServiceName}}
+            Target index: {{(string.IsNullOrWhiteSpace(TargetIndexName) ? "N/A" : TargetIndexName)}}
+            Backup directory: {{BackupDirectory}}
+            Does this look correct? Press any key to continue, Ctrl+C to cancel.");
+        """);
         Console.ReadLine();
 
-        SourceIndexClient = new SearchIndexClient(new Uri("https://" + SourceSearchServiceName + ".search.windows.net"), new AzureKeyCredential(SourceAdminKey));
-        SourceSearchClient = SourceIndexClient.GetSearchClient(SourceIndexName);
+        DefaultAzureCredentialOptions credentialOptions = new DefaultAzureCredentialOptions();
 
+        switch (AzureCloudInstance)
+        {
+            case AzureCloudInstance.AzureUsGovernment:
+                credentialOptions.AuthorityHost = AzureAuthorityHosts.AzureGovernment;
+                SearchServiceDNSSuffix = configuration["Endpoint"] ?? "search.azure.us";
+                break;
 
-        TargetIndexClient = new SearchIndexClient(new Uri($"https://" + TargetSearchServiceName + ".search.windows.net"), new AzureKeyCredential(TargetAdminKey));
-        TargetSearchClient = TargetIndexClient.GetSearchClient(TargetIndexName);
+            case AzureCloudInstance.AzurePublic:
+            default:
+                credentialOptions.AuthorityHost = AzureAuthorityHosts.AzurePublicCloud;
+                SearchServiceDNSSuffix = configuration["Endpoint"] ?? "search.windows.net";
+                break;
+        }
+
+        switch (AuthenticationMethod)
+        {
+            case AuthenticationMethodEnum.APIKey:
+                SourceIndexClient = new SearchIndexClient(new Uri($"https://{SourceSearchServiceName}.{SearchServiceDNSSuffix}"), new AzureKeyCredential(SourceAdminKey));
+
+                TargetIndexClient = new SearchIndexClient(new Uri($"https://{TargetSearchServiceName}.{SearchServiceDNSSuffix}"), new AzureKeyCredential(TargetAdminKey));
+                break;
+            case AuthenticationMethodEnum.ManagedIdentity:
+            default:
+                DefaultAzureCredential defaultAzureCredential = new DefaultAzureCredential(credentialOptions);
+                SourceIndexClient = new SearchIndexClient(new Uri($"https://{SourceSearchServiceName}.{SearchServiceDNSSuffix}"), defaultAzureCredential);
+
+                TargetIndexClient = new SearchIndexClient(new Uri($"https://{TargetSearchServiceName}.{SearchServiceDNSSuffix}"), defaultAzureCredential);
+                break;
+        }
+
+        if (IndexCopyMode == IndexCopyModeEnum.Single)
+        {
+            SourceSearchClient = SourceIndexClient.GetSearchClient(SourceIndexName);
+            TargetSearchClient = TargetIndexClient.GetSearchClient(TargetIndexName);
+        }
     }
 
-    static void BackupIndexAndDocuments()
+    static void BackupIndexAndDocuments(string indexName)
     {
         // Backup the index schema to the specified backup directory
-        Console.WriteLine("\n Backing up source index schema to {0}\n", Path.Combine(BackupDirectory, SourceIndexName + ".schema"));
+        Console.WriteLine("\n Backing up source index schema to {0}\n", Path.Combine(BackupDirectory, indexName + ".schema"));
 
-        File.WriteAllText(Path.Combine(BackupDirectory, SourceIndexName + ".schema"), GetIndexSchema());
+        File.WriteAllText(Path.Combine(BackupDirectory, indexName + ".schema"), GetIndexSchema());
 
         // Extract the content to JSON files
         int SourceDocCount = GetCurrentDocCount(SourceSearchClient);
@@ -201,9 +262,11 @@ class Program
     {
         // Extract the schema for this index
         // We use REST here because we can take the response as-is
+        //TODO: Perform via SearchIndexClient and/or SearchClient.
 
-        Uri ServiceUri = new Uri("https://" + SourceSearchServiceName + ".search.windows.net");
+        Uri ServiceUri = new Uri($"https://{SourceSearchServiceName}.{SearchServiceDNSSuffix}");
         HttpClient HttpClient = new HttpClient();
+
         HttpClient.DefaultRequestHeaders.Add("api-key", SourceAdminKey);
 
         string Schema = string.Empty;
