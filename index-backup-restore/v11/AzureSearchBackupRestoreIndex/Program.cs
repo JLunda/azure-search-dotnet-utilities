@@ -17,7 +17,6 @@ using Azure.Search.Documents.Indexes.Models;
 using Azure.Search.Documents.Models;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Identity.Client;
-using Newtonsoft.Json.Serialization;
 
 namespace AzureSearchBackupRestoreIndex;
 
@@ -67,7 +66,8 @@ class Program
                 break;
 
             case IndexCopyModeEnum.All:
-                foreach (var index in SourceIndexClient.GetIndexes())
+                Pageable<SearchIndex> indices = SourceIndexClient.GetIndexes();
+                foreach (var index in indices)
                 {
                     SetupIndexSearchClients(index.Name, index.Name);
                     BackupIndexAndDocuments(index.Name);
@@ -105,7 +105,7 @@ class Program
         IConfigurationBuilder builder = new ConfigurationBuilder().AddJsonFile("appsettings.json");
         IConfigurationRoot configuration = builder.Build();
 
-        AzureCloudInstance = Enum.TryParse(configuration["AzureCloud"], out AzureCloudInstance azureCloudInstanceParsed) ? azureCloudInstanceParsed : AzureCloudInstance.AzurePublic;
+        AzureCloudInstance = Enum.TryParse(configuration["AzureCloud"], ignoreCase: true, out AzureCloudInstance azureCloudInstanceParsed) ? azureCloudInstanceParsed : AzureCloudInstance.AzurePublic;
         SourceSearchServiceName = configuration["SourceSearchServiceName"];
         SourceAdminKey = configuration["SourceAdminKey"];
         SourceIndexName = configuration["SourceIndexName"];
@@ -113,7 +113,7 @@ class Program
         TargetAdminKey = configuration["TargetAdminKey"];
         TargetIndexName = configuration["TargetIndexName"];
         BackupDirectory = configuration["BackupDirectory"];
-        AuthenticationMethod = Enum.TryParse(configuration["AuthenticationMethod"], out AuthenticationMethodEnum shouldUseManagedIdentityParsed) ? shouldUseManagedIdentityParsed : AuthenticationMethodEnum.ManagedIdentity;
+        AuthenticationMethod = Enum.TryParse(configuration["AuthenticationMethod"], ignoreCase: true, out AuthenticationMethodEnum shouldUseManagedIdentityParsed) ? shouldUseManagedIdentityParsed : AuthenticationMethodEnum.ManagedIdentity;
         IndexCopyMode = Enum.TryParse(configuration["IndexCopyMode"], ignoreCase: true, out IndexCopyModeEnum indexCopyModeParsed) ? indexCopyModeParsed : IndexCopyModeEnum.All;
 
         Console.WriteLine($$"""
@@ -131,35 +131,38 @@ class Program
         Console.ReadLine();
 
         DefaultAzureCredentialOptions = new DefaultAzureCredentialOptions();
+        SearchClientOptions searchClientOptions = new SearchClientOptions();
 
         switch (AzureCloudInstance)
         {
             case AzureCloudInstance.AzureUsGovernment:
                 DefaultAzureCredentialOptions.AuthorityHost = AzureAuthorityHosts.AzureGovernment;
                 SearchServiceDNSSuffix = configuration["Endpoint"] ?? "search.azure.us";
+                searchClientOptions.Audience = SearchAudience.AzureGovernment;
                 break;
 
             case AzureCloudInstance.AzurePublic:
             default:
                 DefaultAzureCredentialOptions.AuthorityHost = AzureAuthorityHosts.AzurePublicCloud;
                 SearchServiceDNSSuffix = configuration["Endpoint"] ?? "search.windows.net";
+                searchClientOptions.Audience = SearchAudience.AzurePublicCloud;
                 break;
         }
 
         switch (AuthenticationMethod)
         {
             case AuthenticationMethodEnum.APIKey:
-                SourceIndexClient = new SearchIndexClient(new Uri($"https://{SourceSearchServiceName}.{SearchServiceDNSSuffix}"), new AzureKeyCredential(SourceAdminKey));
+                SourceIndexClient = new SearchIndexClient(new Uri($"https://{SourceSearchServiceName}.{SearchServiceDNSSuffix}"), new AzureKeyCredential(SourceAdminKey), searchClientOptions);
 
-                TargetIndexClient = new SearchIndexClient(new Uri($"https://{TargetSearchServiceName}.{SearchServiceDNSSuffix}"), new AzureKeyCredential(TargetAdminKey));
+                TargetIndexClient = new SearchIndexClient(new Uri($"https://{TargetSearchServiceName}.{SearchServiceDNSSuffix}"), new AzureKeyCredential(TargetAdminKey), searchClientOptions);
                 break;
             case AuthenticationMethodEnum.ManagedIdentity:
             default:
                 DefaultAzureCredential = new DefaultAzureCredential(DefaultAzureCredentialOptions);
 
-                SourceIndexClient = new SearchIndexClient(new Uri($"https://{SourceSearchServiceName}.{SearchServiceDNSSuffix}"), DefaultAzureCredential);
+                SourceIndexClient = new SearchIndexClient(new Uri($"https://{SourceSearchServiceName}.{SearchServiceDNSSuffix}"), DefaultAzureCredential, searchClientOptions);
 
-                TargetIndexClient = new SearchIndexClient(new Uri($"https://{TargetSearchServiceName}.{SearchServiceDNSSuffix}"), DefaultAzureCredential);
+                TargetIndexClient = new SearchIndexClient(new Uri($"https://{TargetSearchServiceName}.{SearchServiceDNSSuffix}"), DefaultAzureCredential, searchClientOptions);
                 break;
         }
     }
@@ -177,7 +180,7 @@ class Program
         // Backup the index schema to the specified backup directory
         Console.WriteLine("\n Backing up source index schema to {0}\n", Path.Combine(BackupDirectory, indexName + ".schema"));
 
-        File.WriteAllText(Path.Combine(BackupDirectory, indexName + ".schema"), GetIndexSchema());
+        File.WriteAllText(Path.Combine(BackupDirectory, indexName + ".schema"), GetIndexSchema(indexName));
 
         // Extract the content to JSON files
         int SourceDocCount = GetCurrentDocCount(SourceSearchClient);
@@ -188,9 +191,9 @@ class Program
     {
         // Write document files in batches (per MaxBatchSize) in parallel
         int FileCounter = 0;
-        for (int batch = 0; batch <= (CurrentDocCount / MaxBatchSize); batch += ParallelizedJobs)
+        double batchRatio = (double)CurrentDocCount / MaxBatchSize;
+        for (int batch = 0; batch <= batchRatio; batch += ParallelizedJobs)
         {
-
             List<Task> tasks = new List<Task>();
             for (int job = 0; job < ParallelizedJobs; job++)
             {
