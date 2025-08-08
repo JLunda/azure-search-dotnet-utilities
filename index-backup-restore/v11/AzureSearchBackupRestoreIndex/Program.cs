@@ -131,9 +131,17 @@ class Program
             Target service: {{TargetSearchServiceName}}
             Target index: {{(string.IsNullOrWhiteSpace(TargetIndexName) ? "N/A" : TargetIndexName)}}
             Backup directory: {{BackupDirectory}}
-            Does this look correct? Press any key to continue, Ctrl+C to cancel.");
+            Does this look correct? Enter Y to continue");
         """);
-        Console.ReadLine();
+
+        string entry = Console.ReadLine();
+
+        if (!string.Equals(entry, "Y", StringComparison.InvariantCultureIgnoreCase))
+        {
+            Console.WriteLine("Exiting program.");
+            Environment.Exit(1);
+            return;
+        }
 
         DefaultAzureCredentialOptions = new DefaultAzureCredentialOptions();
         SearchClientOptions searchClientOptions = new SearchClientOptions();
