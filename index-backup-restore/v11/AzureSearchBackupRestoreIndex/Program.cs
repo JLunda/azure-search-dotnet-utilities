@@ -5,11 +5,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Azure;
+using Azure.Core;
 using Azure.Identity;
 using Azure.Search.Documents;
 using Azure.Search.Documents.Indexes;
@@ -23,6 +24,8 @@ namespace AzureSearchBackupRestoreIndex;
 class Program
 {
     private static AzureCloudInstance AzureCloudInstance = AzureCloudInstance.AzurePublic;
+
+    private static string RESTAPIVersion;
     private static string SearchServiceDNSSuffix;
     private static string SourceSearchServiceName;
     private static string SourceAdminKey;
@@ -106,6 +109,7 @@ class Program
         IConfigurationRoot configuration = builder.Build();
 
         AzureCloudInstance = Enum.TryParse(configuration["AzureCloud"], ignoreCase: true, out AzureCloudInstance azureCloudInstanceParsed) ? azureCloudInstanceParsed : AzureCloudInstance.AzurePublic;
+        RESTAPIVersion = configuration["RESTAPIVersion"];
         SourceSearchServiceName = configuration["SourceSearchServiceName"];
         SourceAdminKey = configuration["SourceAdminKey"];
         SourceIndexName = configuration["SourceIndexName"];
@@ -120,6 +124,7 @@ class Program
         CONFIGURATION:
             Azure Cloud: {{AzureCloudInstance}}
             Authentication Method: {{AuthenticationMethod}}
+            REST API: {{RESTAPIVersion}}
             Index Copy Mode: {{IndexCopyMode}}
             Source service: {{SourceSearchServiceName}}
             Source Index: {{(string.IsNullOrWhiteSpace(SourceIndexName) ? "N/A" : SourceIndexName)}}
@@ -177,17 +182,25 @@ class Program
 
     static void BackupIndexAndDocuments(string indexName)
     {
-        // Backup the index schema to the specified backup directory
-        Console.WriteLine("\n Backing up source index schema to {0}\n", Path.Combine(BackupDirectory, indexName + ".schema"));
+        try
+        {
+            // Backup the index schema to the specified backup directory
+            Console.WriteLine("\n Backing up source index schema to {0}\n", Path.Combine(BackupDirectory, indexName + ".schema"));
 
-        File.WriteAllText(Path.Combine(BackupDirectory, indexName + ".schema"), GetIndexSchema(indexName));
+            File.WriteAllText(Path.Combine(BackupDirectory, indexName + ".schema"), SourceIndexClient.GetIndex(indexName).GetRawResponse().Content.ToString());
 
-        // Extract the content to JSON files
-        int SourceDocCount = GetCurrentDocCount(SourceSearchClient);
-        WriteIndexDocuments(SourceDocCount, indexName);     // Output content from index to json files
+            // Extract the content to JSON files
+            long SourceDocCount = SourceSearchClient.GetDocumentCount();
+
+            WriteIndexDocumentsToFile(indexName);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("Error occurred when backing up index: ", ex);
+        }
     }
 
-    static void WriteIndexDocuments(int CurrentDocCount, string sourceIndexName)
+    static void WriteIndexDocuments(long CurrentDocCount, string sourceIndexName)
     {
         // Write document files in batches (per MaxBatchSize) in parallel
         int FileCounter = 0;
@@ -213,6 +226,39 @@ class Program
         }
 
         return;
+    }
+
+    static void WriteIndexDocumentsToFile(string indexName)
+    {
+        try
+        {
+            SearchOptions options = new SearchOptions()
+            {
+                IncludeTotalCount = true,
+                SearchMode = SearchMode.All
+            };
+
+            SearchResults<SearchDocument> searchResults = SourceSearchClient.Search<SearchDocument>("*", options).Value;
+
+            Pageable<SearchResult<SearchDocument>> documents = searchResults.GetResults();
+
+            StringBuilder jsonStringBuilder = new StringBuilder(@"{""value"":");
+
+            jsonStringBuilder.Append(JsonSerializer.Serialize(documents.Select(doc => doc.Document)));
+            jsonStringBuilder.Append("}");
+
+            jsonStringBuilder.Replace("\"Latitude\":", "\"type\": \"Point\", \"coordinates\": [");
+            jsonStringBuilder.Replace("\"Longitude\":", "");
+            jsonStringBuilder.Replace(",\"IsEmpty\":false,\"Z\":null,\"M\":null,\"CoordinateSystem\":{\"EpsgId\":4326,\"Id\":\"4326\",\"Name\":\"WGS84\"}", "]");
+
+            File.WriteAllText(Path.Combine(BackupDirectory, $"{indexName}.json"), jsonStringBuilder.ToString());
+
+            Console.WriteLine("Total documents: {0}", searchResults.TotalCount);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("An error occured when writing Index Documents to file: ", ex);
+        }
     }
 
     static void ExportToJSON(int Skip, string FileName)
@@ -279,33 +325,6 @@ class Program
         return IDFieldName;
     }
 
-    static string GetIndexSchema()
-    {
-        // Extract the schema for this index
-        // We use REST here because we can take the response as-is
-        //TODO: Perform via SearchIndexClient and/or SearchClient.
-
-        Uri ServiceUri = new Uri($"https://{SourceSearchServiceName}.{SearchServiceDNSSuffix}");
-        HttpClient HttpClient = new HttpClient();
-
-        HttpClient.DefaultRequestHeaders.Add("api-key", SourceAdminKey);
-
-        string Schema = string.Empty;
-        try
-        {
-            Uri uri = new Uri(ServiceUri, "/indexes/" + SourceIndexName);
-            HttpResponseMessage response = AzureSearchHelper.SendSearchRequest(HttpClient, HttpMethod.Get, uri);
-            AzureSearchHelper.EnsureSuccessfulSearchResponse(response);
-            Schema = response.Content.ReadAsStringAsync().Result;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("Error: {0}", ex.Message);
-        }
-
-        return Schema;
-    }
-
     private static bool DeleteIndex(string targetIndexName)
     {
         try
@@ -334,17 +353,20 @@ class Program
 
             string json = File.ReadAllText(Path.Combine(BackupDirectory, sourceIndexName + ".schema"));
 
-            // Do some cleaning of this file to change index name, etc
-            json = "{" + json.Substring(json.IndexOf("\"name\""));
-            int indexOfIndexName = json.IndexOf("\"", json.IndexOf("name\"") + 5) + 1;
-            int indexOfEndOfIndexName = json.IndexOf("\"", indexOfIndexName);
-            json = json.Substring(0, indexOfIndexName) + TargetIndexName + json.Substring(indexOfEndOfIndexName);
-
             Uri ServiceUri = new Uri($"https://{TargetSearchServiceName}.{SearchServiceDNSSuffix}");
 
-            SearchIndex indexObj = JsonSerializer.Deserialize<SearchIndex>(json);
+            Request indexCreateRequest = TargetIndexClient.Pipeline.CreateRequest();
+            indexCreateRequest.Method = RequestMethod.Post;
+            indexCreateRequest.Uri = new RequestUriBuilder { Host = ServiceUri.Host, Path = $"/indexes", Query = $"?api-version={RESTAPIVersion}", Scheme = "https", Port = 443 };
+            indexCreateRequest.Content = json;
+            indexCreateRequest.Headers.Add(new HttpHeader("Content-Type", "application/json"));
 
-            Response<SearchIndex> response = TargetIndexClient.CreateIndex(indexObj);
+            Response response = TargetIndexClient.Pipeline.SendRequest(indexCreateRequest, CancellationToken.None);
+
+            if (response.IsError)
+            {
+                throw new Exception($"Unsuccessful response when creating target index: {response}");
+            }
         }
         catch (Exception ex)
         {
@@ -385,9 +407,22 @@ class Program
 
             foreach (string fileName in Directory.GetFiles(BackupDirectory, $"{sourceIndexName}*.json"))
             {
-                Console.WriteLine("  -Uploading documents from file {0}", fileName);
-                var docs = JsonSerializer.Deserialize<SearchDocument>(File.ReadAllText(fileName));
-                var response = searchClient.UploadDocuments(docs);
+                Console.WriteLine("Uploading documents from file {0}", fileName);
+
+                var fileContent = File.ReadAllText(fileName);
+
+                Request indexDocumentsRequest = TargetIndexClient.Pipeline.CreateRequest();
+                indexDocumentsRequest.Method = RequestMethod.Post;
+                indexDocumentsRequest.Uri = new RequestUriBuilder { Host = ServiceUri.Host, Path = $"/indexes('{targetIndexName}')/docs/search.index", Query = $"?api-version={RESTAPIVersion}", Scheme = "https", Port = 443 };
+                indexDocumentsRequest.Content = File.ReadAllText(fileName);
+                indexDocumentsRequest.Headers.Add(new HttpHeader("Content-Type", "application/json"));
+
+                Response response = TargetIndexClient.Pipeline.SendRequest(indexDocumentsRequest, CancellationToken.None);
+
+                if (response.IsError)
+                {
+                    throw new Exception($"Unsuccessful response when creating target index: {response}");
+                }
             }
         }
         catch (Exception ex)
