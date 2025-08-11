@@ -193,12 +193,18 @@ class Program
         try
         {
             // Backup the index schema to the specified backup directory
+            // TODO: Create option that allows user to choose whether or not to upload empty indexes.
+            // TODO: Implement option to allow user to skip local backup.
             Console.WriteLine("\n Backing up source index schema to {0}\n", Path.Combine(BackupDirectory, indexName + ".schema"));
 
             File.WriteAllText(Path.Combine(BackupDirectory, indexName + ".schema"), SourceIndexClient.GetIndex(indexName).GetRawResponse().Content.ToString());
 
             // Extract the content to JSON files
             long SourceDocCount = SourceSearchClient.GetDocumentCount();
+            if (SourceDocCount <= 0)
+            {
+                return;
+            }
 
             WriteIndexDocuments(SourceDocCount, indexName);
         }
@@ -250,6 +256,11 @@ class Program
             };
 
             SearchResults<SearchDocument> searchResults = SourceSearchClient.Search<SearchDocument>("*", options).Value;
+
+            if (searchResults.TotalCount <= 0)
+            {
+                return;
+            }
 
             Pageable<SearchResult<SearchDocument>> documents = searchResults.GetResults();
 
