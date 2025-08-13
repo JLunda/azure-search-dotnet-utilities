@@ -131,9 +131,17 @@ class Program
             Target service: {{TargetSearchServiceName}}
             Target index: {{(string.IsNullOrWhiteSpace(TargetIndexName) ? "N/A" : TargetIndexName)}}
             Backup directory: {{BackupDirectory}}
-            Does this look correct? Press any key to continue, Ctrl+C to cancel.");
+            Does this look correct? Enter Y to continue");
         """);
-        Console.ReadLine();
+
+        string entry = Console.ReadLine();
+
+        if (!string.Equals(entry, "Y", StringComparison.InvariantCultureIgnoreCase))
+        {
+            Console.WriteLine("Exiting program.");
+            Environment.Exit(1);
+            return;
+        }
 
         DefaultAzureCredentialOptions = new DefaultAzureCredentialOptions();
         SearchClientOptions searchClientOptions = new SearchClientOptions();
@@ -185,14 +193,20 @@ class Program
         try
         {
             // Backup the index schema to the specified backup directory
+            // TODO: Create option that allows user to choose whether or not to upload empty indexes.
+            // TODO: Implement option to allow user to skip local backup.
             Console.WriteLine("\n Backing up source index schema to {0}\n", Path.Combine(BackupDirectory, indexName + ".schema"));
 
             File.WriteAllText(Path.Combine(BackupDirectory, indexName + ".schema"), SourceIndexClient.GetIndex(indexName).GetRawResponse().Content.ToString());
 
             // Extract the content to JSON files
             long SourceDocCount = SourceSearchClient.GetDocumentCount();
+            if (SourceDocCount <= 0)
+            {
+                return;
+            }
 
-            WriteIndexDocumentsToFile(indexName);
+            WriteIndexDocuments(SourceDocCount, indexName);
         }
         catch (Exception ex)
         {
@@ -228,17 +242,25 @@ class Program
         return;
     }
 
-    static void WriteIndexDocumentsToFile(string indexName)
+    static void ExportToJSON(int Skip, string FileName)
     {
+        // Extract all the documents from the selected index to JSON files in batches of 500 docs / file
         try
         {
             SearchOptions options = new SearchOptions()
             {
                 IncludeTotalCount = true,
-                SearchMode = SearchMode.All
+                SearchMode = SearchMode.All,
+                Size = MaxBatchSize,
+                Skip = Skip
             };
 
             SearchResults<SearchDocument> searchResults = SourceSearchClient.Search<SearchDocument>("*", options).Value;
+
+            if (searchResults.TotalCount <= 0)
+            {
+                return;
+            }
 
             Pageable<SearchResult<SearchDocument>> documents = searchResults.GetResults();
 
@@ -251,52 +273,13 @@ class Program
             jsonStringBuilder.Replace("\"Longitude\":", "");
             jsonStringBuilder.Replace(",\"IsEmpty\":false,\"Z\":null,\"M\":null,\"CoordinateSystem\":{\"EpsgId\":4326,\"Id\":\"4326\",\"Name\":\"WGS84\"}", "]");
 
-            File.WriteAllText(Path.Combine(BackupDirectory, $"{indexName}.json"), jsonStringBuilder.ToString());
+            File.WriteAllText(FileName, jsonStringBuilder.ToString());
 
             Console.WriteLine("Total documents: {0}", searchResults.TotalCount);
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine("An error occured when writing Index Documents to file: ", ex);
-        }
-    }
-
-    static void ExportToJSON(int Skip, string FileName)
-    {
-        // Extract all the documents from the selected index to JSON files in batches of 500 docs / file
-        string json = string.Empty;
-        try
-        {
-            SearchOptions options = new SearchOptions()
-            {
-                IncludeTotalCount = true,
-                SearchMode = SearchMode.All,
-                Size = MaxBatchSize,
-                Skip = Skip
-            };
-
-            SearchResults<SearchDocument> response = SourceSearchClient.Search<SearchDocument>("*", options);
-
-            foreach (var doc in response.GetResults())
-            {
-                json += JsonSerializer.Serialize(doc.Document) + ",";
-                json = json.Replace("\"Latitude\":", "\"type\": \"Point\", \"coordinates\": [");
-                json = json.Replace("\"Longitude\":", "");
-                json = json.Replace(",\"IsEmpty\":false,\"Z\":null,\"M\":null,\"CoordinateSystem\":{\"EpsgId\":4326,\"Id\":\"4326\",\"Name\":\"WGS84\"}", "]");
-                json += "\n";
-            }
-
-            // Output the formatted content to a file
-            json = json.Substring(0, json.Length - 3); // remove trailing comma
-            File.WriteAllText(FileName, "{\"value\": [");
-            File.AppendAllText(FileName, json);
-            File.AppendAllText(FileName, "]}");
-            Console.WriteLine("Total documents: {0}", response.TotalCount);
-            json = string.Empty;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("Error: {0}", ex.Message);
         }
     }
 
