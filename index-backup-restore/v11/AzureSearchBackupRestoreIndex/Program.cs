@@ -34,6 +34,8 @@ class Program
     private static string TargetAdminKey;
     private static string TargetIndexName;
     private static string BackupDirectory;
+
+    public static bool BackupOnly;
     private static AuthenticationMethodEnum AuthenticationMethod;
     private static IndexCopyModeEnum IndexCopyMode;
     private static DefaultAzureCredentialOptions DefaultAzureCredentialOptions;
@@ -61,11 +63,14 @@ class Program
                 SetupIndexSearchClients(SourceIndexName, TargetIndexName);
                 BackupIndexAndDocuments(SourceIndexName);
                 //Recreate and import content to target index
-                Console.WriteLine("\nSTART INDEX RESTORE");
-                DeleteIndex(TargetIndexName);
-                CreateTargetIndex(SourceIndexName, TargetIndexName);
-                ImportFromJSON(SourceIndexName, TargetIndexName);
-                PerformSanityCheck();
+                if (!BackupOnly)
+                {
+                    Console.WriteLine("\nSTART INDEX RESTORE");
+                    DeleteIndex(TargetIndexName);
+                    CreateTargetIndex(SourceIndexName, TargetIndexName);
+                    ImportFromJSON(SourceIndexName, TargetIndexName);
+                    PerformSanityCheck();
+                }
                 break;
 
             case IndexCopyModeEnum.All:
@@ -74,11 +79,14 @@ class Program
                 {
                     SetupIndexSearchClients(index.Name, index.Name);
                     BackupIndexAndDocuments(index.Name);
-                    Console.WriteLine("\nSTART INDEX RESTORE");
-                    DeleteIndex(index.Name);
-                    CreateTargetIndex(index.Name, index.Name);
-                    ImportFromJSON(index.Name, index.Name);
-                    PerformSanityCheck();
+                    if (!BackupOnly)
+                    {
+                        Console.WriteLine("\nSTART INDEX RESTORE");
+                        DeleteIndex(index.Name);
+                        CreateTargetIndex(index.Name, index.Name);
+                        ImportFromJSON(index.Name, index.Name);
+                        PerformSanityCheck();
+                    }
                 }
                 break;
             default:
@@ -117,6 +125,7 @@ class Program
         TargetAdminKey = configuration["TargetAdminKey"];
         TargetIndexName = configuration["TargetIndexName"];
         BackupDirectory = configuration["BackupDirectory"];
+        BackupOnly = bool.TryParse(configuration["BackupOnly"], out bool shouldOnlyBackup) ? shouldOnlyBackup : false;
         AuthenticationMethod = Enum.TryParse(configuration["AuthenticationMethod"], ignoreCase: true, out AuthenticationMethodEnum shouldUseManagedIdentityParsed) ? shouldUseManagedIdentityParsed : AuthenticationMethodEnum.ManagedIdentity;
         IndexCopyMode = Enum.TryParse(configuration["IndexCopyMode"], ignoreCase: true, out IndexCopyModeEnum indexCopyModeParsed) ? indexCopyModeParsed : IndexCopyModeEnum.All;
 
@@ -131,6 +140,7 @@ class Program
             Target service: {{TargetSearchServiceName}}
             Target index: {{(string.IsNullOrWhiteSpace(TargetIndexName) ? "N/A" : TargetIndexName)}}
             Backup directory: {{BackupDirectory}}
+            Backup Only: {{BackupOnly}}
             Does this look correct? Enter Y to continue");
         """);
 
