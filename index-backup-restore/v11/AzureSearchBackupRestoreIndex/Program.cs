@@ -33,6 +33,7 @@ class Program
     private static string TargetSearchServiceName;
     private static string TargetAdminKey;
     private static string TargetIndexName;
+    private static ExistingTargetIndexBehaviorEnum ExistingTargetIndexBehavior = ExistingTargetIndexBehaviorEnum.Merge;
     private static string BackupDirectory;
 
     public static bool BackupOnly;
@@ -66,7 +67,10 @@ class Program
                 if (!BackupOnly)
                 {
                     Console.WriteLine("\nSTART INDEX RESTORE");
-                    DeleteIndex(TargetIndexName);
+                    if (ExistingTargetIndexBehavior == ExistingTargetIndexBehaviorEnum.Delete)
+                    {
+                        DeleteIndex(TargetIndexName);
+                    }
                     CreateTargetIndex(SourceIndexName, TargetIndexName);
                     ImportFromJSON(SourceIndexName, TargetIndexName);
                     PerformSanityCheck();
@@ -82,7 +86,10 @@ class Program
                     if (!BackupOnly)
                     {
                         Console.WriteLine("\nSTART INDEX RESTORE");
-                        DeleteIndex(index.Name);
+                        if (ExistingTargetIndexBehavior == ExistingTargetIndexBehaviorEnum.Delete)
+                        {
+                            DeleteIndex(index.Name);
+                        }
                         CreateTargetIndex(index.Name, index.Name);
                         ImportFromJSON(index.Name, index.Name);
                         PerformSanityCheck();
@@ -124,6 +131,7 @@ class Program
         TargetSearchServiceName = configuration["TargetSearchServiceName"];
         TargetAdminKey = configuration["TargetAdminKey"];
         TargetIndexName = configuration["TargetIndexName"];
+        ExistingTargetIndexBehavior = Enum.TryParse(configuration["ExistingTargetIndexBehavior"], ignoreCase: true, out ExistingTargetIndexBehaviorEnum result) ? result : ExistingTargetIndexBehaviorEnum.Merge;
         BackupDirectory = configuration["BackupDirectory"];
         BackupOnly = bool.TryParse(configuration["BackupOnly"], out bool shouldOnlyBackup) ? shouldOnlyBackup : false;
         AuthenticationMethod = Enum.TryParse(configuration["AuthenticationMethod"], ignoreCase: true, out AuthenticationMethodEnum shouldUseManagedIdentityParsed) ? shouldUseManagedIdentityParsed : AuthenticationMethodEnum.ManagedIdentity;
@@ -139,6 +147,7 @@ class Program
             Source Index: {{(string.IsNullOrWhiteSpace(SourceIndexName) ? "N/A" : SourceIndexName)}}
             Target service: {{TargetSearchServiceName}}
             Target index: {{(string.IsNullOrWhiteSpace(TargetIndexName) ? "N/A" : TargetIndexName)}}
+            Existing Target Index Behavior: {{ExistingTargetIndexBehavior}}
             Backup directory: {{BackupDirectory}}
             Backup Only: {{BackupOnly}}
             Does this look correct? Enter Y to continue");
@@ -349,7 +358,7 @@ class Program
             Uri ServiceUri = new Uri($"https://{TargetSearchServiceName}.{SearchServiceDNSSuffix}");
 
             Request indexCreateRequest = TargetIndexClient.Pipeline.CreateRequest();
-            indexCreateRequest.Method = RequestMethod.Post;
+            indexCreateRequest.Method = RequestMethod.Put;
             indexCreateRequest.Uri = new RequestUriBuilder { Host = ServiceUri.Host, Path = $"/indexes", Query = $"?api-version={RESTAPIVersion}", Scheme = "https", Port = 443 };
             indexCreateRequest.Content = json;
             indexCreateRequest.Headers.Add(new HttpHeader("Content-Type", "application/json"));
